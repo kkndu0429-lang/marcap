@@ -2,6 +2,12 @@ name: Update MARCAP via KRX Open API
 
 on:
   workflow_dispatch:
+    inputs:
+      bas_dd:
+        description: KRX 기준일 YYYYMMDD (비우면 최근 거래일 자동 탐색)
+        required: false
+        type: string
+        default: ''
   schedule:
     - cron: "30 9 * * 1-5"
 
@@ -18,23 +24,46 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: python -m pip install --upgrade pandas pyarrow
-      - name: Resolve KRX date
-        id: date
-        run: |
-          echo "bas_dd=$(TZ=Asia/Seoul date +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "year=$(TZ=Asia/Seoul date +%Y)" >> "$GITHUB_OUTPUT"
       - name: Fetch and write MARCAP
+        id: fetch
         env:
           KRX_AUTH_KEY: ${{ secrets.KRX_AUTH_KEY }}
+          REQUESTED_DATE: ${{ github.event.inputs.bas_dd }}
         run: |
+          set -euo pipefail
           test -n "$KRX_AUTH_KEY"
-          python krx_marcap_openapi_adapter_v1.py \
-            --date "${{ steps.date.outputs.bas_dd }}" \
-            --output "data/marcap-${{ steps.date.outputs.year }}.parquet"
+          dates=()
+          if [ -n "${REQUESTED_DATE:-}" ]; then
+            dates+=("$REQUESTED_DATE")
+          else
+            start="$(TZ=Asia/Seoul date +%Y-%m-%d)"
+            for offset in $(seq 0 10); do
+              dates+=("$(date -d "$start - $offset day" +%Y%m%d)")
+            done
+          fi
+          selected=""
+          for bas_dd in "${dates[@]}"; do
+            year="${bas_dd:0:4}"
+            output="data/marcap-${year}.parquet"
+            echo "Trying KRX date ${bas_dd}"
+            if python krx_marcap_openapi_adapter_v1.py --date "$bas_dd" --output "$output"; then
+              selected="$bas_dd"
+              break
+            fi
+          done
+          test -n "$selected"
+          echo "selected_date=$selected" >> "$GITHUB_OUTPUT"
       - name: Commit API-only artifact
+        env:
+          SELECTED_DATE: ${{ steps.fetch.outputs.selected_date }}
         run: |
+          set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add data/
-          git diff --cached --quiet || git commit -m "Update MARCAP via KRX Open API"
-          git push
+          git add data/marcap-*.parquet
+          if git diff --cached --quiet; then
+            echo "No artifact changes for $SELECTED_DATE"
+          else
+            git commit -m "Update MARCAP via KRX Open API ($SELECTED_DATE)"
+            git push
+          fi
